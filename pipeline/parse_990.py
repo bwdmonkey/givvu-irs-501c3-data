@@ -67,14 +67,26 @@ def _find_element(root: etree._Element, local_names: list[str]) -> etree._Elemen
 
 
 def _el_text(parent: etree._Element | None, local_names: list[str]) -> str | None:
-    """Get text from a child element matching any of the given local names."""
+    """Get text from a child element matching any of the given local names.
+
+    Uses both namespace-aware and local-name() xpath matching to handle
+    the IRS namespace.
+    """
     if parent is None:
         return None
     for name in local_names:
+        # Try with each known namespace prefix
         for prefix in _NS_PREFIXES:
             el = parent.find(f".//{prefix}{name}")
             if el is not None and el.text:
                 return el.text.strip()
+        # Fallback: match by local-name() (ignores namespace entirely)
+        try:
+            els = parent.xpath(f".//*[local-name()='{name}']")
+            if els and els[0].text:
+                return els[0].text.strip()
+        except Exception:
+            pass
     return None
 
 
@@ -216,7 +228,10 @@ def parse_filing(xml_path: Path, object_id: str) -> dict | None:
     filing["noncash_contributions_total"] = _safe_int(noncash_val)
 
     # ── Has Schedule M? (Part IV lines 29/30) ──
+    # The IRS uses DeductibleNonCashContriInd in recent schemas.
     sched_m_names = [
+        "DeductibleNonCashContriInd",
+        "DeductibleArtContributionInd",
         "NoncashContributionsInd",
         "MoreThan25KNoncashInd",
         "ArtHistTreasuresContribInd",
@@ -264,7 +279,10 @@ _SCHED_M_LINE_NAMES: dict[str, list[str]] = {
     "historical_artifacts":       ["HistoricalArtifacts", "HistoricalArtifactsGrp"],
     "scientific_specimens":       ["ScientificSpecimens", "ScientificSpecimensGrp"],
     "archaeological_artifacts":   ["ArcheologicalArtifacts", "ArcheologicalArtifactsGrp"],
-    "other_1":                    ["OtherNoncashContri25", "OtherNoncashContriTable25Grp"],
+    # "Other" types: the IRS uses a single repeating element for lines 25-28.
+    # We handle these specially in the parser below.
+    "other_1":                    ["OtherNonCashContriTableGrp", "OtherNoncashContri25",
+                                   "OtherNoncashContriTable25Grp"],
     "other_2":                    ["OtherNoncashContri26", "OtherNoncashContriTable26Grp"],
     "other_3":                    ["OtherNoncashContri27", "OtherNoncashContriTable27Grp"],
     "other_4":                    ["OtherNoncashContri28", "OtherNoncashContriTable28Grp"],
@@ -273,21 +291,22 @@ _SCHED_M_LINE_NAMES: dict[str, list[str]] = {
 # Child element names for checkbox / count / amount / method within each
 # property-type group element.
 _CHECKBOX_NAMES = [
-    "NoncashCheckboxInd", "NonCashCheckbox",
+    "NonCashCheckboxInd", "NoncashCheckboxInd", "NonCashCheckbox",
     "ContributionCheckInd", "Checkbox",
 ]
 _COUNT_NAMES = [
-    "NoncashContributionsCnt", "NoncashContributions",
+    "ContributionCnt", "NoncashContributionsCnt", "NoncashContributions",
     "ContributionsItemsCnt", "NumberOfContributions",
 ]
 _AMOUNT_NAMES = [
-    "NoncashContributionsAmt", "NoncashContributions",
+    "NoncashContributionsRptF990Amt", "NoncashContributionsAmt",
     "FairMarketValueAmt", "FMVReportedAmt",
-    "NoncashContributionAmt",
+    "NoncashContributionAmt", "NoncashContributions",
 ]
 _METHOD_NAMES = [
-    "MethodOfDeterminingAmt", "MethodOfDetermination",
-    "MethodOfDeterminationDesc", "NoncashContributionMethod",
+    "MethodOfDeterminingRevenuesTxt", "MethodOfDeterminingAmt",
+    "MethodOfDetermination", "MethodOfDeterminationDesc",
+    "NoncashContributionMethod",
 ]
 _DESC_NAMES = [
     "Desc", "Description", "TypeDesc",
@@ -320,13 +339,40 @@ def parse_schedule_m(xml_path: Path, object_id: str, ein: str | None, tax_year: 
     }
 
     # ── Property types (lines 1-28) ──
-    for _line, prefix, _desc in SCHEDULE_M_PROPERTY_TYPES:
-        line_names = _SCHED_M_LINE_NAMES.get(prefix, [])
-        grp = None
-        for ln in line_names:
-            grp = _find_element(sched_m, [ln])
-            if grp is not None:
+    # The IRS uses repeating OtherNonCashContriTableGrp elements for lines 25-28.
+    # Collect them all so we can assign to other_1..other_4 in order.
+    other_grps: list[etree._Element] = []
+    for tag in ["OtherNonCashContriTableGrp", "OtherNoncashContriTableGrp"]:
+        for prefix_ns in _NS_PREFIXES:
+            others = sched_m.findall(f".//{prefix_ns}{tag}")
+            if others:
+                other_grps.extend(others)
                 break
+        if other_grps:
+            break
+    # Also try local-name xpath
+    if not other_grps:
+        try:
+            other_grps = sched_m.xpath(".//*[local-name()='OtherNonCashContriTableGrp']")
+        except Exception:
+            pass
+
+    other_idx = 0  # Index into other_grps
+
+    for _line, prefix, _desc in SCHEDULE_M_PROPERTY_TYPES:
+        grp = None
+
+        if prefix.startswith("other_"):
+            # Use the collected OtherNonCashContriTableGrp elements in order
+            if other_idx < len(other_grps):
+                grp = other_grps[other_idx]
+                other_idx += 1
+        else:
+            line_names = _SCHED_M_LINE_NAMES.get(prefix, [])
+            for ln in line_names:
+                grp = _find_element(sched_m, [ln])
+                if grp is not None:
+                    break
 
         if grp is not None:
             record[f"{prefix}_x"] = _safe_bool(
@@ -352,7 +398,7 @@ def parse_schedule_m(xml_path: Path, object_id: str, ein: str | None, tax_year: 
 
     # ── Summary questions (lines 29-32) ──
     record["num_forms_8283"] = _safe_int(
-        _el_text(sched_m, ["NumberOf8283Received", "NumberOf8283ReceivedCnt", "Form8283ReceivedCnt"])
+        _el_text(sched_m, ["Form8283ReceivedCnt", "NumberOf8283Received", "NumberOf8283ReceivedCnt"])
     )
     record["hold_3_years_required"] = _safe_bool(
         _el_text(sched_m, [

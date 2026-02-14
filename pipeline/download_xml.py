@@ -1,176 +1,210 @@
 #!/usr/bin/env python3
-"""Asynchronously download 990 XML files from AWS S3 in parallel.
+"""Download 990 XML files from the IRS TEOS ZIP bundles.
 
-Reads the filtered index CSV produced by ``download_index.py`` and downloads
-each XML return into ``data/xml/<object_id>.xml``.  A checkpoint file tracks
-which object IDs have already been downloaded so the process can be resumed.
+The IRS distributes e-filed 990 returns as monthly ZIP archives.  Each ZIP
+contains thousands of individual XML files.  This module:
+
+1. Reads the filtered index to determine which ZIP bundles are needed.
+2. Downloads each unique ZIP bundle (skipping already-downloaded ones).
+3. Extracts only the XML files for object IDs in our filtered index.
+
+A checkpoint file tracks which bundles have been fully processed.
 """
 
 from __future__ import annotations
 
-import asyncio
 import csv
 import logging
+import zipfile
+from collections import defaultdict
 from pathlib import Path
 
-import aiohttp
+import requests
 from tqdm import tqdm
 
 from pipeline.config import (
     INDEX_DIR,
+    TAX_YEARS,
     XML_DIR,
-    XML_DOWNLOAD_CONCURRENCY,
-    s3_xml_url,
+    ZIP_DIR,
+    irs_zip_url,
 )
 
 logger = logging.getLogger(__name__)
 
-CHECKPOINT_FILE = XML_DIR / ".downloaded.txt"
+CHECKPOINT_FILE = ZIP_DIR / ".processed_batches.txt"
 
 
 def _load_checkpoint() -> set[str]:
-    """Load the set of already-downloaded object IDs."""
     if not CHECKPOINT_FILE.exists():
         return set()
     return set(CHECKPOINT_FILE.read_text().splitlines())
 
 
-def _append_checkpoint(object_ids: list[str]) -> None:
-    """Append newly-downloaded object IDs to the checkpoint file."""
+def _append_checkpoint(batch_id: str) -> None:
     with open(CHECKPOINT_FILE, "a", encoding="utf-8") as f:
-        for oid in object_ids:
-            f.write(oid + "\n")
+        f.write(batch_id + "\n")
 
 
 def load_index() -> list[dict]:
     """Read the filtered index and return a list of dicts."""
     path = INDEX_DIR / "filtered_index.csv"
     if not path.exists():
-        raise FileNotFoundError(
-            f"{path} not found. Run download_index.py first."
-        )
+        raise FileNotFoundError(f"{path} not found. Run download_index.py first.")
     rows: list[dict] = []
     with open(path, newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
+        for row in csv.DictReader(f):
             rows.append(row)
     return rows
 
 
-async def _download_one(
-    session: aiohttp.ClientSession,
-    semaphore: asyncio.Semaphore,
-    object_id: str,
-    dest: Path,
-) -> str | None:
-    """Download a single XML file. Returns object_id on success, None on failure."""
-    url = s3_xml_url(object_id)
-    async with semaphore:
+def _group_by_batch(index_rows: list[dict]) -> dict[tuple[int, str], set[str]]:
+    """Group object IDs by (year, batch_id) for targeted extraction."""
+    groups: dict[tuple[int, str], set[str]] = defaultdict(set)
+    for row in index_rows:
+        batch_id = row.get("xml_batch_id", "").strip()
+        oid = row.get("object_id", "").strip()
+        if not batch_id or not oid:
+            continue
+        # Extract year from batch_id (e.g., "2025_TEOS_XML_01A" → 2025)
         try:
-            async with session.get(url) as resp:
-                if resp.status == 200:
-                    content = await resp.read()
-                    dest.write_bytes(content)
-                    return object_id
-                else:
-                    logger.warning("HTTP %d for %s", resp.status, object_id)
-                    return None
-        except Exception:
-            logger.debug("Error downloading %s", object_id, exc_info=True)
-            return None
+            year = int(batch_id[:4])
+        except (ValueError, IndexError):
+            # Fall back to TAX_YEARS[0]
+            year = TAX_YEARS[0] if TAX_YEARS else 2025
+        groups[(year, batch_id)].add(oid)
+    return groups
 
 
-async def download_xmls(
-    max_concurrent: int = XML_DOWNLOAD_CONCURRENCY,
-    force: bool = False,
-    limit: int | None = None,
+def download_and_extract_batch(
+    year: int,
+    batch_id: str,
+    target_oids: set[str] | None = None,
 ) -> int:
-    """Download 990 XML files for all filings in the filtered index.
+    """Download a ZIP bundle and extract target XMLs.
 
     Parameters
     ----------
-    max_concurrent : int
-        Maximum number of simultaneous HTTP connections.
-    force : bool
-        If True, re-download even if the checkpoint says it is done.
-    limit : int | None
-        If set, only download this many files (useful for testing).
+    year : int
+        Filing year (used to construct the URL path).
+    batch_id : str
+        The ZIP batch identifier (e.g., ``2025_TEOS_XML_01A``).
+    target_oids : set[str] | None
+        If provided, only extract XMLs whose object_id is in this set.
+        If None, extract all XMLs.
 
     Returns
     -------
     int
-        Number of newly-downloaded files.
+        Number of XML files extracted.
+    """
+    zip_path = ZIP_DIR / f"{batch_id}.zip"
+
+    # Download ZIP if not already present
+    if not zip_path.exists() or zip_path.stat().st_size == 0:
+        url = irs_zip_url(batch_id, year)
+        logger.info("Downloading %s ...", url)
+        resp = requests.get(url, timeout=600, stream=True)
+        resp.raise_for_status()
+        with open(zip_path, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                f.write(chunk)
+        logger.debug("Saved %s (%d MB)", zip_path.name, zip_path.stat().st_size // (1024 * 1024))
+
+    # Extract XMLs
+    extracted = 0
+    try:
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            for name in zf.namelist():
+                if not name.lower().endswith(".xml"):
+                    continue
+
+                # Determine object_id from filename (e.g., "202543569349100509_public.xml")
+                stem = Path(name).stem  # e.g., "202543569349100509_public"
+                oid = stem.replace("_public", "")
+
+                # If we have a target set, only extract matching files
+                if target_oids is not None and oid not in target_oids:
+                    continue
+
+                dest = XML_DIR / f"{oid}.xml"
+                if dest.exists():
+                    extracted += 1
+                    continue
+
+                data = zf.read(name)
+                dest.write_bytes(data)
+                extracted += 1
+    except zipfile.BadZipFile:
+        logger.error("Bad ZIP file: %s — deleting and will retry next run", zip_path)
+        zip_path.unlink(missing_ok=True)
+        return 0
+
+    return extracted
+
+
+def download_xmls(
+    force: bool = False,
+    limit_batches: int | None = None,
+) -> int:
+    """Download and extract all needed ZIP bundles.
+
+    Parameters
+    ----------
+    force : bool
+        If True, re-process already-completed batches.
+    limit_batches : int | None
+        If set, only process this many batches (useful for testing).
+
+    Returns
+    -------
+    int
+        Total number of XML files extracted.
     """
     index_rows = load_index()
     if not index_rows:
         logger.warning("Filtered index is empty. Nothing to download.")
         return 0
 
-    # Determine which files still need downloading
-    if force:
-        done: set[str] = set()
-    else:
-        done = _load_checkpoint()
+    batch_groups = _group_by_batch(index_rows)
+    if not batch_groups:
+        logger.warning("No batch IDs found in index. Nothing to download.")
+        return 0
 
-    to_download = [
-        row for row in index_rows
-        if row["object_id"] not in done
-    ]
+    done = set() if force else _load_checkpoint()
+    to_process = {k: v for k, v in batch_groups.items() if k[1] not in done}
 
-    if limit is not None:
-        to_download = to_download[:limit]
+    if limit_batches is not None:
+        keys = list(to_process.keys())[:limit_batches]
+        to_process = {k: to_process[k] for k in keys}
 
-    if not to_download:
-        logger.info("All %d XML files already downloaded.", len(index_rows))
+    if not to_process:
+        logger.info("All %d batches already processed.", len(batch_groups))
         return 0
 
     logger.info(
-        "Downloading %d XML files (%d already done, %d total) ...",
-        len(to_download), len(done), len(index_rows),
+        "Processing %d ZIP batches (%d already done, %d total) ...",
+        len(to_process), len(done), len(batch_groups),
     )
 
-    semaphore = asyncio.Semaphore(max_concurrent)
-    connector = aiohttp.TCPConnector(limit=max_concurrent, limit_per_host=max_concurrent)
-    timeout = aiohttp.ClientTimeout(total=60, connect=15)
+    total_extracted = 0
+    for (year, batch_id), target_oids in tqdm(to_process.items(), desc="Downloading ZIPs"):
+        try:
+            n = download_and_extract_batch(year, batch_id, target_oids)
+            total_extracted += n
+            _append_checkpoint(batch_id)
+            logger.debug("Batch %s: extracted %d XMLs", batch_id, n)
+        except Exception:
+            logger.exception("Failed to process batch %s", batch_id)
 
-    downloaded: list[str] = []
-    batch_size = 500  # Checkpoint every N downloads
-
-    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-        pbar = tqdm(total=len(to_download), desc="Downloading XMLs")
-        tasks: list[asyncio.Task] = []
-
-        for row in to_download:
-            oid = row["object_id"]
-            dest = XML_DIR / f"{oid}.xml"
-            task = asyncio.create_task(
-                _download_one(session, semaphore, oid, dest)
-            )
-            tasks.append(task)
-
-        for coro in asyncio.as_completed(tasks):
-            result = await coro
-            pbar.update(1)
-            if result:
-                downloaded.append(result)
-                # Periodic checkpoint
-                if len(downloaded) % batch_size == 0:
-                    _append_checkpoint(downloaded[-batch_size:])
-
-        pbar.close()
-
-    # Final checkpoint write
-    remainder = len(downloaded) % batch_size
-    if remainder:
-        _append_checkpoint(downloaded[-remainder:])
-
-    logger.info("Downloaded %d new XML files.", len(downloaded))
-    return len(downloaded)
+    logger.info("Downloaded and extracted %d XML files from %d batches.",
+                total_extracted, len(to_process))
+    return total_extracted
 
 
 def run(force: bool = False, limit: int | None = None) -> int:
-    """Synchronous entry point for the async downloader."""
-    return asyncio.run(download_xmls(force=force, limit=limit))
+    """Synchronous entry point."""
+    return download_xmls(force=force, limit_batches=limit)
 
 
 if __name__ == "__main__":

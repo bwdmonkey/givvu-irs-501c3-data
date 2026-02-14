@@ -22,10 +22,11 @@ DATA_DIR = Path(os.getenv("DATA_DIR", "./data"))
 BMF_DIR = DATA_DIR / "bmf"
 INDEX_DIR = DATA_DIR / "index"
 XML_DIR = DATA_DIR / "xml"
+ZIP_DIR = DATA_DIR / "zip"
 PARSED_DIR = DATA_DIR / "parsed"
 CONCORDANCE_DIR = DATA_DIR / "concordance"
 
-for d in [BMF_DIR, INDEX_DIR, XML_DIR, PARSED_DIR, CONCORDANCE_DIR]:
+for d in [BMF_DIR, INDEX_DIR, XML_DIR, ZIP_DIR, PARSED_DIR, CONCORDANCE_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
 # ---------------------------------------------------------------------------
@@ -34,7 +35,7 @@ for d in [BMF_DIR, INDEX_DIR, XML_DIR, PARSED_DIR, CONCORDANCE_DIR]:
 XML_DOWNLOAD_CONCURRENCY = int(os.getenv("XML_DOWNLOAD_CONCURRENCY", "50"))
 TAX_YEARS = [
     int(y.strip())
-    for y in os.getenv("TAX_YEARS", "2022,2023,2024").split(",")
+    for y in os.getenv("TAX_YEARS", "2023,2024,2025").split(",")
 ]
 
 # ---------------------------------------------------------------------------
@@ -57,19 +58,24 @@ BMF_URLS = {
 }
 
 # ---------------------------------------------------------------------------
-# IRS 990 E-File on AWS S3
+# IRS 990 E-File – TEOS (Tax Exempt Organization Search) downloads
+# The IRS moved data from AWS S3 to apps.irs.gov in late 2021.
+# XMLs are distributed as monthly ZIP bundles, each containing many returns.
 # ---------------------------------------------------------------------------
-S3_BASE_URL = "https://s3.amazonaws.com/irs-form-990"
+IRS_TEOS_BASE_URL = "https://apps.irs.gov/pub/epostcard/990/xml"
 
 
-def s3_index_url(year: int) -> str:
+def irs_index_url(year: int) -> str:
     """Return the CSV index URL for a given filing year."""
-    return f"{S3_BASE_URL}/index_{year}.csv"
+    return f"{IRS_TEOS_BASE_URL}/{year}/index_{year}.csv"
 
 
-def s3_xml_url(object_id: str) -> str:
-    """Return the XML filing URL for a given object ID."""
-    return f"{S3_BASE_URL}/{object_id}_public.xml"
+def irs_zip_url(batch_id: str, year: int) -> str:
+    """Return the ZIP bundle URL for a given batch ID.
+
+    Example batch_id: ``2025_TEOS_XML_01A``
+    """
+    return f"{IRS_TEOS_BASE_URL}/{year}/{batch_id}.zip"
 
 
 # ---------------------------------------------------------------------------

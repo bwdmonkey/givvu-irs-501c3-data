@@ -167,7 +167,7 @@ SELECT
     COALESCE(m.drugs_medical_x, FALSE)              AS accepts_drugs_medical,
     COALESCE(m.securities_publicly_traded_x, FALSE) AS accepts_securities,
     ({noncash_sum})                                 AS total_noncash_amount,
-    ({noncash_count})                               AS noncash_category_count,
+    ({noncash_count})                               AS noncash_category_count
 
 FROM {orgs} AS o
 LEFT JOIN latest_filing AS lf ON o.ein = lf.ein

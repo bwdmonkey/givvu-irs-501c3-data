@@ -67,9 +67,10 @@ def parse_bmf_csv(path: Path) -> list[dict]:
     reader = csv.DictReader(io.StringIO(text))
 
     for row in reader:
-        # Filter: SUBSECTION == 3 → 501(c)(3)
+        # Filter: SUBSECTION == 03 → 501(c)(3)
+        # The BMF CSV stores this as "03" (zero-padded)
         sub = row.get("SUBSECTION", "").strip()
-        if sub != "3":
+        if sub not in ("3", "03"):
             continue
 
         record: dict = {}

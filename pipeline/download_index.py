@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Download IRS 990 e-file index files from AWS S3 and filter for full-990 filers.
+"""Download IRS 990 e-file index files and filter for full-990 filers.
+
+The IRS moved 990 e-file data from AWS S3 to apps.irs.gov in late 2021.
+Index CSVs are now at:
+    https://apps.irs.gov/pub/epostcard/990/xml/{year}/index_{year}.csv
 
 Produces a CSV at ``data/index/filtered_index.csv`` containing only Form 990
 (full) filers that are 501(c)(3) organizations.  The optional EIN filter is
@@ -21,33 +25,20 @@ from pipeline.config import (
     INDEX_DIR,
     PARSED_DIR,
     TAX_YEARS,
-    s3_index_url,
+    irs_index_url,
 )
 
 logger = logging.getLogger(__name__)
 
-# Columns in the S3 index CSV
-INDEX_COLUMNS = [
-    "RETURN_ID",
-    "FILING_TYPE",
-    "EIN",
-    "TAX_PERIOD",
-    "SUB_DATE",
-    "TAXPAYER_NAME",
-    "RETURN_TYPE",
-    "DLN",
-    "OBJECT_ID",
-]
 
-
-def download_index_csv(year: int) -> Path:
-    """Download the S3 index CSV for the given filing year."""
+def download_index_csv(year: int, force: bool = False) -> Path:
+    """Download the IRS TEOS index CSV for the given filing year."""
     dest = INDEX_DIR / f"index_{year}.csv"
-    if dest.exists() and dest.stat().st_size > 0:
+    if dest.exists() and dest.stat().st_size > 0 and not force:
         logger.debug("Index for %d already downloaded.", year)
         return dest
 
-    url = s3_index_url(year)
+    url = irs_index_url(year)
     logger.info("Downloading index for %d from %s", year, url)
     resp = requests.get(url, timeout=300, stream=True)
     resp.raise_for_status()
@@ -73,16 +64,22 @@ def load_501c3_eins() -> set[str] | None:
         )
         return None
 
+    if orgs_path.stat().st_size == 0:
+        logger.warning("organizations.jsonl is empty; skipping EIN filter.")
+        return None
+
     eins: set[str] = set()
     with open(orgs_path, "r", encoding="utf-8") as f:
         for line in f:
+            if not line.strip():
+                continue
             row = json.loads(line)
             ein = row.get("ein")
             if ein:
                 # Pad to 9 digits for matching
                 eins.add(str(ein).zfill(9))
     logger.info("Loaded %d 501(c)(3) EINs for filtering.", len(eins))
-    return eins
+    return eins if eins else None
 
 
 def build_filtered_index(
@@ -102,7 +99,7 @@ def build_filtered_index(
     index_paths: list[Path] = []
     for year in TAX_YEARS:
         try:
-            index_paths.append(download_index_csv(year))
+            index_paths.append(download_index_csv(year, force=force))
         except Exception:
             logger.exception("Failed to download index for %d", year)
 
@@ -126,6 +123,8 @@ def build_filtered_index(
             df = df.drop(columns=["EIN_PADDED"])
 
         for _, row in df.iterrows():
+            # The new IRS format includes XML_BATCH_ID which tells us
+            # which ZIP bundle the XML is in.
             all_rows.append({
                 "object_id": str(row.get("OBJECT_ID", "")).strip(),
                 "ein": str(row.get("EIN", "")).strip().zfill(9),
@@ -134,6 +133,7 @@ def build_filtered_index(
                 "return_type": str(row.get("RETURN_TYPE", "")).strip(),
                 "sub_date": str(row.get("SUB_DATE", "")).strip(),
                 "dln": str(row.get("DLN", "")).strip(),
+                "xml_batch_id": str(row.get("XML_BATCH_ID", "")).strip(),
             })
 
     # Write filtered index
@@ -141,7 +141,7 @@ def build_filtered_index(
     with open(output_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=[
             "object_id", "ein", "tax_period", "taxpayer_name",
-            "return_type", "sub_date", "dln",
+            "return_type", "sub_date", "dln", "xml_batch_id",
         ])
         writer.writeheader()
         writer.writerows(all_rows)
